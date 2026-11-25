@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -26,12 +28,14 @@ from nemo_rl.algorithms.dpo import (
     _initial_dpo_save_state,
     add_ref_logprobs_to_data,
     dpo_train,
+    setup,
 )
-from nemo_rl.algorithms.loss import PreferenceLossFn
+from nemo_rl.algorithms.loss import DPOLossConfig, DPOLossFn, PreferenceLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 def test_get_dpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -115,10 +119,16 @@ class MockPolicy:
         return {"reference_logprobs": self.logprobs}
 
 
-def test_add_logprobs_to_batch():
+@pytest.mark.parametrize(
+    ("num_pairs", "is_val", "expected_rows"),
+    [(1, False, 8), (2, False, 8), (4, False, 8), (1, True, 4), (3, True, 8)],
+)
+def test_add_logprobs_to_batch(
+    num_pairs: int, is_val: bool, expected_rows: int
+) -> None:
     """Test that add_ref_logprobs_to_data correctly adds reference policy logprobs to batches."""
     # Create mock data
-    batch_size = 8
+    batch_size = num_pairs * 2
     seq_len = 4
     vocab_size = 16
 
@@ -126,10 +136,13 @@ def test_add_logprobs_to_batch():
     mock_batch = {
         "input_ids": torch.randint(0, vocab_size, (batch_size, seq_len)),
         "attention_mask": torch.ones(batch_size, seq_len),
+        "sample_mask": torch.ones(batch_size),
+        "pair_index": torch.arange(num_pairs).repeat_interleave(2),
+        "is_chosen": torch.arange(batch_size) % 2 == 0,
     }
 
     # Create mock logprobs that will be returned by the policy
-    mock_logprobs = torch.randn(batch_size, seq_len)
+    mock_logprobs = torch.randn(expected_rows, seq_len)
 
     # Create a mock dataloader that yields our mock batch
     mock_dataloader = MagicMock()
@@ -140,12 +153,15 @@ def test_add_logprobs_to_batch():
 
     # Create a mock master config
     mock_master_config = MasterConfig.model_construct(
-        **{"policy": {"train_micro_batch_size": 1}}
+        policy={"train_micro_batch_size": 1, "train_global_batch_size": 4},
+        dpo=DPOConfig(val_micro_batch_size=1),
     )
 
     # Get the augmented batches
     augmented_batches = list(
-        add_ref_logprobs_to_data(mock_dataloader, mock_policy, mock_master_config)
+        add_ref_logprobs_to_data(
+            mock_dataloader, mock_policy, mock_master_config, is_val=is_val
+        )
     )
 
     # Verify we got exactly one batch
@@ -153,12 +169,27 @@ def test_add_logprobs_to_batch():
     augmented_batch = augmented_batches[0]
 
     # Verify the original batch data is preserved
-    assert torch.equal(augmented_batch["input_ids"], mock_batch["input_ids"])
-    assert torch.equal(augmented_batch["attention_mask"], mock_batch["attention_mask"])
+    assert torch.equal(
+        augmented_batch["input_ids"][:batch_size], mock_batch["input_ids"]
+    )
+    assert torch.equal(
+        augmented_batch["attention_mask"][:batch_size], mock_batch["attention_mask"]
+    )
+    assert augmented_batch.size == expected_rows
+    assert augmented_batch["sample_mask"].sum().item() == batch_size
+    assert not augmented_batch["sample_mask"][batch_size:].any()
+    assert torch.equal(
+        augmented_batch["pair_index"][::2], augmented_batch["pair_index"][1::2]
+    )
+    assert augmented_batch["pair_index"][::2].unique().numel() == expected_rows // 2
+    assert augmented_batch["is_chosen"].tolist() == [True, False] * (expected_rows // 2)
 
     # Verify the reference policy logprobs were added correctly
     assert "reference_policy_logprobs" in augmented_batch
-    assert augmented_batch["reference_policy_logprobs"].shape == (batch_size, seq_len)
+    assert augmented_batch["reference_policy_logprobs"].shape == (
+        expected_rows,
+        seq_len,
+    )
 
     # Verify the logprobs were rolled by -1 as expected
     expected_logprobs = torch.roll(mock_logprobs, -1, dims=-1)
@@ -184,8 +215,8 @@ def mock_dpo_components():
             "global_valid_toks": [10],
         },
     }
-    policy.get_reference_policy_logprobs.return_value = {
-        "reference_logprobs": torch.randn(2, 10)
+    policy.get_reference_policy_logprobs.side_effect = lambda batch, **_: {
+        "reference_logprobs": torch.zeros_like(batch["input_ids"], dtype=torch.float32)
     }
     policy.sharding_annotations = NamedSharding(
         layout=np.arange(1).reshape(1, -1, 1, 1),  # 1 GPU to match cluster config
@@ -197,21 +228,15 @@ def mock_dpo_components():
         ],
     )
 
-    # Create a proper message log structure with token_ids
+    # Match the collated rows for the configured two-pair global batch.
     mock_batch = BatchedDataDict(
         {
-            "message_log": [
-                [  # chosen
-                    {"role": "user", "token_ids": torch.tensor([1, 2, 3])},
-                    {"role": "assistant", "token_ids": torch.tensor([4, 5, 6])},
-                ],
-                [  # rejected
-                    {"role": "user", "token_ids": torch.tensor([1, 2, 3])},
-                    {"role": "assistant", "token_ids": torch.tensor([7, 8, 9, 10, 11])},
-                ],
-            ],
-            "length": torch.tensor([6, 8]),
-            "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "input_ids": torch.ones(4, 10, dtype=torch.long),
+            "input_lengths": torch.full((4,), 10),
+            "token_mask": torch.ones(4, 10),
+            "sample_mask": torch.ones(4),
+            "pair_index": torch.tensor([0, 0, 1, 1]),
+            "is_chosen": torch.tensor([True, False, True, False]),
         }
     )
 
@@ -278,6 +303,132 @@ def mock_dpo_components():
         "checkpointer": checkpointer,
         "master_config": master_config,
     }
+
+
+@pytest.mark.parametrize(
+    ("num_pairs", "sample_weight"),
+    [(1, 1.0), (4, 1.0), (16, 1.0), (260, 1.0), (1, 0.5)],
+)
+def test_training_retains_all_pairs_each_epoch(
+    mock_dpo_components: dict, num_pairs: int, sample_weight: float, tmp_path: Path
+) -> None:
+    components = mock_dpo_components
+    cfg = components["master_config"]
+    cfg.policy.update(
+        train_global_batch_size=16,
+        dynamic_batching={"enabled": False},
+        sequence_packing={"enabled": False},
+        megatron_cfg={"enabled": False},
+    )
+    cfg.dpo.max_num_steps = 100
+    cfg.dpo.val_period = 0
+    cfg.data = {"shuffle": True, "num_workers": 0}
+    cfg.logger = LoggerConfig(log_dir=str(tmp_path))
+    cfg.cluster = ClusterConfig(num_nodes=1, gpus_per_node=2)
+    policy = components["policy"]
+    policy.sharding_annotations = MockPolicy(None).sharding_annotations
+    checkpointer = components["checkpointer"]
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.load_training_info.return_value = None
+    checkpointer.get_resume_paths.return_value = (None, None)
+    dataset = [
+        {
+            "message_log_chosen": [
+                {"role": "user", "token_ids": torch.tensor([index + 1])},
+                {"role": "assistant", "token_ids": torch.tensor([2, 3])},
+            ],
+            "message_log_rejected": [
+                {"role": "user", "token_ids": torch.tensor([index + 1])},
+                {"role": "assistant", "token_ids": torch.tensor([4, 5])},
+            ],
+            "length_chosen": 3,
+            "length_rejected": 3,
+            "loss_multiplier": sample_weight,
+            "idx": index,
+        }
+        for index in range(num_pairs)
+    ]
+
+    def reference_logprobs(batch: BatchedDataDict, **kwargs: object) -> dict:
+        assert batch.size == 32
+        return {
+            "reference_logprobs": torch.zeros_like(
+                batch["input_ids"], dtype=torch.float32
+            )
+        }
+
+    policy.get_reference_policy_logprobs.side_effect = reference_logprobs
+    with (
+        patch("nemo_rl.algorithms.dpo.Logger", return_value=components["logger"]),
+        patch("nemo_rl.algorithms.dpo.CheckpointManager", return_value=checkpointer),
+        patch("nemo_rl.algorithms.dpo.RayVirtualCluster"),
+        patch("nemo_rl.algorithms.dpo.Policy", return_value=policy),
+    ):
+        _, _, train_loader, val_loaders, loss_fn, _, _, state, _ = setup(
+            cfg, components["tokenizer"], dataset, {}
+        )
+    updates_per_epoch = math.ceil(num_pairs / 16)
+    assert len(train_loader) == updates_per_epoch
+    dpo_train(
+        policy,
+        train_loader,
+        val_loaders,
+        components["tokenizer"],
+        loss_fn,
+        cfg,
+        components["logger"],
+        checkpointer,
+        state,
+    )
+    assert policy.train.call_count == updates_per_epoch * 2
+    assert state.consumed_samples == num_pairs * 2
+    for epoch in range(2):
+        seen = []
+        for call in policy.train.call_args_list[
+            epoch * updates_per_epoch : (epoch + 1) * updates_per_epoch
+        ]:
+            batch = call.args[0]
+            real_chosen = batch["sample_mask"].bool() & batch["is_chosen"]
+            seen.extend(batch["input_ids"][real_chosen, 0].tolist())
+        assert sorted(seen) == list(range(1, num_pairs + 1))
+
+
+@pytest.mark.parametrize("sft_loss_weight", [0.0, 0.25])
+def test_masked_tail_does_not_change_loss_metrics_or_gradients(
+    sft_loss_weight: float,
+) -> None:
+    batch = BatchedDataDict(
+        input_ids=torch.ones(6, 4, dtype=torch.long),
+        token_mask=torch.ones(6, 4),
+        sample_mask=torch.ones(6),
+        pair_index=torch.arange(3).repeat_interleave(2),
+        is_chosen=torch.arange(6) % 2 == 0,
+    )
+    cfg = MasterConfig.model_construct(
+        policy={"train_micro_batch_size": 1, "train_global_batch_size": 8}
+    )
+    padded = next(
+        add_ref_logprobs_to_data([batch], MockPolicy(torch.zeros(16, 4)), cfg)
+    )
+    loss_fn = DPOLossFn(DPOLossConfig(sft_loss_weight=sft_loss_weight))
+    values = torch.linspace(-1.0, 0.5, 18).reshape(6, 3).requires_grad_()
+    batch["reference_policy_logprobs"] = torch.zeros(6, 4)
+    loss, metrics = loss_fn(
+        values, batch, batch["sample_mask"].sum(), torch.tensor(18.0)
+    )
+    loss.backward()
+    # Extreme filler scores expose accidental inclusion in either the loss or metrics.
+    padded_values = torch.cat(
+        [values.detach(), torch.full((10, 3), 100.0)]
+    ).requires_grad_()
+    padded_loss, padded_metrics = loss_fn(
+        padded_values, padded, padded["sample_mask"].sum(), torch.tensor(18.0)
+    )
+    padded_loss.backward()
+    torch.testing.assert_close(padded_loss, loss)
+    assert padded_metrics == pytest.approx(metrics)
+    torch.testing.assert_close(padded_values.grad[:6], values.grad)
+    assert not padded_values.grad[6:].any()
 
 
 def test_exit_on_max_steps(mock_dpo_components):

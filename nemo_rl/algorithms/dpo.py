@@ -254,7 +254,7 @@ def setup(
             ],
             add_loss_mask=True,
         ),
-        drop_last=True,
+        drop_last=False,
         num_workers=data_config["num_workers"],
     )
 
@@ -370,14 +370,14 @@ def add_ref_logprobs_to_data(dataloader, policy, master_config, is_val=False):
                 else master_config.policy["train_micro_batch_size"] * 2
             )
 
-            # when running validation with drop_last=False, we might end up with a partial batch.
-            # In this case, we pad the batch to the next multiple of micro_batch_size * dp_size.
             dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
-            if batch.size % (dp_size * micro_batch_size) != 0:
-                assert is_val, (
-                    "Partial batches should only happen during validation, but got a partial batch during training."
-                )
-                batch = maybe_pad_last_batch(batch, dp_size, micro_batch_size)
+            # Training workers require a full global batch, including masked padding.
+            padding_mbs = (
+                micro_batch_size
+                if is_val
+                else master_config.policy["train_global_batch_size"] * 2 // dp_size
+            )
+            batch = maybe_pad_last_batch(batch, dp_size, padding_mbs)
 
             ## append ref policy logprobs to batch
             logprobs = policy.get_reference_policy_logprobs(
@@ -737,9 +737,9 @@ def dpo_train(
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
-                dpo_save_state.consumed_samples += master_config.policy[
-                    "train_global_batch_size"
-                ]
+                dpo_save_state.consumed_samples += (
+                    int(batch["sample_mask"].count_nonzero().item()) // 2
+                )
                 timeout.mark_iteration()
 
                 should_save_by_step = (

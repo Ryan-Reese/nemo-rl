@@ -529,14 +529,12 @@ def maybe_pad_last_batch(
     """
     min_padding = (math.ceil(batch.size / (mbs * dp_size)) * mbs * dp_size) - batch.size
     if min_padding > 0:
-        print(f"Padding last validation batch with {min_padding} padding samples")
+        print(f"Padding last batch with {min_padding} padding samples")
         from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
         if "pair_index" in batch and "is_chosen" in batch:
             if min_padding % 2 != 0:
-                raise ValueError(
-                    "Preference validation batches must be padded by complete pairs."
-                )
+                raise ValueError("Preference batches must be padded by complete pairs.")
             # Padding runs before sequence packing, while preference rows are
             # still interleaved. Duplicate complete media-bearing pairs so all
             # batch-aligned fields remain consistent.
